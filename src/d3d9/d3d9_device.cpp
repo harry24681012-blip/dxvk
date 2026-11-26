@@ -499,6 +499,8 @@ namespace dxvk {
       SetDepthStencilSurface(nullptr);
     }
 
+    m_cursor.ResetCursor();
+
     const bool isExtended = m_d3dCompatibility.test(D3DCompatibility::D3D9Ex);
 
     HRESULT hr;
@@ -3282,6 +3284,9 @@ namespace dxvk {
           DWORD                        Flags) {
     D3D9DeviceLock lock = LockDevice();
 
+    if (unlikely(!CanSWVP()))
+      return D3DERR_INVALIDCALL;
+
     if (unlikely(pDestBuffer == nullptr))
       return D3DERR_INVALIDCALL;
 
@@ -3294,7 +3299,7 @@ namespace dxvk {
         return D3DERR_INVALIDCALL;
     }
 
-    if (!SupportsSWVP()) {
+    if (!SupportsProcessVertices()) {
       static bool s_errorShown = false;
 
       if (!std::exchange(s_errorShown, true))
@@ -3741,7 +3746,7 @@ namespace dxvk {
         const D3D9CommonBuffer* commonBuffer = GetCommonBuffer(buffer);
         m_vbSlotTracking.bound |= bit;
 
-        if (commonBuffer->DoPerDrawUpload() || CanOnlySWVP())
+        if (commonBuffer->DoPerDrawUpload())
           m_vbSlotTracking.uploadPerDraw |= bit;
 
         if (commonBuffer->NeedsUpload())
@@ -4426,7 +4431,7 @@ namespace dxvk {
         return E_INVALIDARG;
 
       const bool isExtended = m_d3dCompatibility.test(D3DCompatibility::D3D9Ex);
-      const Com<D3D9Surface> surface = new D3D9Surface(this, &desc, isExtended, nullptr, pSharedHandle);
+const Com<D3D9Surface> surface = new D3D9Surface(this, &desc, isExtended, nullptr, pSharedHandle);
       m_initializer->InitTexture(surface->GetCommonTexture(), initialData);
       *ppSurface = surface.ref();
 
@@ -4755,7 +4760,7 @@ namespace dxvk {
   }
 
 
-  bool D3D9DeviceEx::SupportsSWVP() {
+  bool D3D9DeviceEx::SupportsProcessVertices() {
     return m_dxvkDevice->features().core.features.vertexPipelineStoresAndAtomics;
   }
 
@@ -4987,23 +4992,28 @@ namespace dxvk {
 
     auto& desc = *(pResource->Desc());
 
+    if (unlikely(!desc.IsLockable))
+      return D3DERR_INVALIDCALL;
+
+    if (!(desc.Usage & D3DUSAGE_DYNAMIC))
+      Flags &= ~(D3DLOCK_NOOVERWRITE | D3DLOCK_DISCARD);
+
     if (unlikely((Flags & (D3DLOCK_DISCARD | D3DLOCK_READONLY)) == (D3DLOCK_DISCARD | D3DLOCK_READONLY)
                && desc.Pool == D3DPOOL_DEFAULT))
       return D3DERR_INVALIDCALL;
-
-    // We only ever wait for textures that were used with GetRenderTargetData or GetFrontBufferData anyway.
-    // Games like Beyond Good and Evil break if this doesn't succeed.
-    Flags &= ~D3DLOCK_DONOTWAIT;
-
-    if (unlikely((Flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE)) == (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE)))
-      Flags &= ~D3DLOCK_DISCARD;
 
     // Tests show that D3D9 drivers ignore DISCARD when the device is lost.
     if (unlikely(m_deviceLostState != D3D9DeviceLostState::Ok))
       Flags &= ~D3DLOCK_DISCARD;
 
-    if (unlikely(!desc.IsLockable))
-      return D3DERR_INVALIDCALL;
+    if (!desc.IsAttachmentOnly)
+      Flags &= ~D3DLOCK_DONOTWAIT;
+
+    if (Flags & D3DLOCK_DISCARD)
+      Flags &= ~(D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY);
+
+    // NOOVERWRITE only impacts buffers
+    Flags &= ~D3DLOCK_NOOVERWRITE;
 
     if (unlikely(pBox != nullptr)) {
       D3DRESOURCETYPE type = pResource->GetType();
@@ -5451,54 +5461,46 @@ namespace dxvk {
     if (unlikely(ppbData == nullptr))
       return D3DERR_INVALIDCALL;
 
-    if (unlikely(!m_d3d9Options.allowDiscard))
-      Flags &= ~D3DLOCK_DISCARD;
-
     auto& desc = *pResource->Desc();
 
-    // Ignore DISCARD if NOOVERWRITE or READONLY is set
-    if (unlikely((Flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY)) != D3DLOCK_DISCARD))
-      Flags &= ~D3DLOCK_DISCARD;
-
-    // Ignore DISCARD and NOOVERWRITE if the buffer is not DEFAULT pool (tests + Halo 2)
-    // The docs say DISCARD and NOOVERWRITE are ignored if the buffer is not DYNAMIC
-    // but tests say otherwise!
-    if (desc.Pool != D3DPOOL_DEFAULT || CanOnlySWVP())
-      Flags &= ~(D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE);
-
-    // Ignore DONOTWAIT if we are DYNAMIC
-    // Yes... D3D9 is a good API.
-    if (desc.Usage & D3DUSAGE_DYNAMIC)
-      Flags &= ~D3DLOCK_DONOTWAIT;
+    if (!(desc.Usage & D3DUSAGE_DYNAMIC))
+      Flags &= ~(D3DLOCK_NOOVERWRITE | D3DLOCK_DISCARD);
 
     // Tests show that D3D9 drivers ignore DISCARD when the device is lost.
     if (unlikely(m_deviceLostState != D3D9DeviceLostState::Ok))
       Flags &= ~D3DLOCK_DISCARD;
 
-    // In SWVP mode, we always use the per-draw upload path.
-    // So the buffer will never be in use on the device.
-    // FVF Buffers are the exception. Those can be used as a destination for ProcessVertices.
-    if (unlikely(CanOnlySWVP() && !pResource->NeedsReadback()))
-      Flags |= D3DLOCK_NOOVERWRITE;
+    // Ignore NOOVERWRITE or READONLY if DISCARD is set
+    if (Flags & D3DLOCK_DISCARD)
+      Flags &= ~(D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY);
 
-    // READONLY is ignored for non-managed pools
-    if ((Flags & D3DLOCK_READONLY) && !IsPoolManaged(desc.Pool))
+    // Ignore READONLY if the buffer is WRITEONLY. This is UB according to the documentation.
+    if (desc.Usage & D3DUSAGE_WRITEONLY)
       Flags &= ~D3DLOCK_READONLY;
 
-    // We only bounds check for MANAGED.
-    // (TODO: Apparently this is meant to happen for DYNAMIC too but I am not sure
-    //  how that works given it is meant to be a DIRECT access..?)
-    const bool respectUserBounds = !(Flags & D3DLOCK_DISCARD) &&
-                                    SizeToLock != 0 &&
-                                    !m_d3d9Options.ignoreDefaultBufferLockRange;
+    // DONOTWAIT can only used with textures
+    Flags &= ~D3DLOCK_DONOTWAIT;
 
-    // If we don't respect the bounds, encompass it all in our tests/checks
-    // These values may be out of range and don't get clamped.
-    uint32_t offset = respectUserBounds ? OffsetToLock : 0;
-    uint32_t size   = respectUserBounds ? std::min(SizeToLock, desc.Size - offset) : desc.Size;
-    D3D9Range lockRange = D3D9Range(offset, offset + size);
+    // 前置防護：防止 Offset 超出 Buffer 尺寸導致無符號整數溢出 (Underflow)
+    if (OffsetToLock >= desc.Size)
+      return D3DERR_INVALIDCALL;
 
-    bool updateDirtyRange = (desc.Pool == D3DPOOL_DEFAULT || !(Flags & D3DLOCK_NO_DIRTY_UPDATE)) && !(Flags & D3DLOCK_READONLY);
+    // 計算預期最大可存取範圍
+    const uint32_t maxSize = desc.Size - OffsetToLock;
+
+    uint32_t size = SizeToLock;
+    if (!m_d3d9Options.ignoreDefaultBufferLockRange || desc.Pool != D3DPOOL_DEFAULT) {
+      size = (SizeToLock == 0) ? maxSize : std::min(SizeToLock, maxSize);
+    }
+
+    D3D9Range lockRange = D3D9Range(OffsetToLock, OffsetToLock + size);
+
+    if (pResource->GetLockCount() != 0)
+      Flags &= ~D3DLOCK_DISCARD;
+
+    const bool directMapping = pResource->GetMapMode() == D3D9_COMMON_BUFFER_MAP_MODE_DIRECT;
+
+   bool updateDirtyRange = (!directMapping && !(Flags & D3DLOCK_NO_DIRTY_UPDATE)) && !(Flags & D3DLOCK_READONLY);
     if (updateDirtyRange) {
       pResource->DirtyRange().Conjoin(lockRange);
 
@@ -5510,12 +5512,11 @@ namespace dxvk {
       }
     }
 
-    const bool directMapping = pResource->GetMapMode() == D3D9_COMMON_BUFFER_MAP_MODE_DIRECT;
-    const bool needsReadback = pResource->NeedsReadback();
+    const bool perDrawUpload = pResource->DoPerDrawUpload();
 
     uint8_t* data = nullptr;
 
-    if ((Flags & D3DLOCK_DISCARD) && (directMapping || needsReadback)) {
+    if ((Flags & D3DLOCK_DISCARD) && !perDrawUpload) {
       // If we're not directly mapped and don't need readback,
       // the buffer is not currently getting used anyway
       // so there's no reason to waste memory by discarding.
@@ -5550,10 +5551,17 @@ namespace dxvk {
       const bool readOnly = Flags & D3DLOCK_READONLY;
       // NOOVERWRITE promises that they will not write in a currently used area.
       const bool noOverwrite = Flags & D3DLOCK_NOOVERWRITE;
+      const bool discard = Flags & D3DLOCK_DISCARD;
       const bool directMapping = pResource->GetMapMode() == D3D9_COMMON_BUFFER_MAP_MODE_DIRECT;
-
+      const bool needsReadback = pResource->NeedsReadback();
+      const bool isDynamic = (pResource->Desc()->Usage & D3DUSAGE_DYNAMIC) != 0;
+      const bool isLargeBuffer = pResource->Desc()->Size > (1024u * 1024u);
       // If we're not directly mapped, we can rely on needsReadback to tell us if a sync is required.
-      const bool skipWait = (!needsReadback && (readOnly || !directMapping)) || noOverwrite;
+      const bool allowFastPath = directMapping || readOnly || noOverwrite;
+      const bool skipWait = !discard 
+                   && (!isLargeBuffer || noOverwrite) 
+                   && (!isDynamic || allowFastPath) 
+                   && ((!needsReadback && allowFastPath) || perDrawUpload);
 
       if (!skipWait) {
         const Rc<DxvkBuffer> mappingBuffer = pResource->GetBuffer<D3D9_COMMON_BUFFER_TYPE_MAPPING>();
@@ -5568,14 +5576,6 @@ namespace dxvk {
     data += OffsetToLock;
     *ppbData = reinterpret_cast<void*>(data);
 
-    DWORD oldFlags = pResource->GetMapFlags();
-
-    // We need to remove the READONLY flags from the map flags
-    // if there was ever a non-readonly upload.
-    if (!(Flags & D3DLOCK_READONLY))
-      oldFlags &= ~D3DLOCK_READONLY;
-
-    pResource->SetMapFlags(Flags | oldFlags);
     pResource->IncrementLockCount();
 
     // We just mapped a buffer which may have come with an address space cost.
@@ -5588,30 +5588,22 @@ namespace dxvk {
 
   HRESULT D3D9DeviceEx::FlushBuffer(
         D3D9CommonBuffer*       pResource) {
-    // Wait until the amount of used staging memory is under a certain threshold to avoid using
-    // too much memory and even more so to avoid using too much address space.
-    ThrottleAllocation();
-
-    auto dstBuffer = pResource->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>();
-    auto srcSlice = pResource->GetMappedSlice();
+    auto dstSlice = pResource->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>();
+    auto srcSlice = pResource->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_STAGING>();
 
     D3D9Range& range = pResource->DirtyRange();
 
-    D3D9BufferSlice slice = AllocStagingBuffer(range.max - range.min);
-    void* srcData = reinterpret_cast<uint8_t*>(srcSlice->mapPtr()) + range.min;
-    memcpy(slice.mapPtr, srcData, range.max - range.min);
-
     EmitCs([
-      cDstSlice  = dstBuffer,
-      cSrcSlice  = slice.slice,
-      cDstOffset = range.min,
+      cDstSlice  = dstSlice,
+      cSrcSlice  = srcSlice,
+      cOffset    = range.min,
       cLength    = range.max - range.min
     ] (DxvkContext* ctx) {
       ctx->copyBuffer(
         cDstSlice.buffer(),
-        cDstSlice.offset() + cDstOffset,
+        cDstSlice.offset() + cOffset,
         cSrcSlice.buffer(),
-        cSrcSlice.offset(),
+        cSrcSlice.offset() + cOffset,
         cLength);
     });
 
@@ -5640,11 +5632,8 @@ namespace dxvk {
     if (pResource->DirtyRange().IsDegenerate())
       return D3D_OK;
 
-    pResource->SetMapFlags(0);
-
-    // Only D3DPOOL_DEFAULT buffers get uploaded in UnlockBuffer.
-    // D3DPOOL_SYSTEMMEM and D3DPOOL_MANAGED get uploaded at draw time.
-    if (pResource->Desc()->Pool != D3DPOOL_DEFAULT || m_d3d9Options.forceDrawTimeBufferUpload)
+    // D3DPOOL_MANAGED buffers get uploaded before drawing.
+    if (pResource->Desc()->Pool == D3DPOOL_MANAGED)
       return D3D_OK;
 
     FlushBuffer(pResource);
@@ -5653,7 +5642,7 @@ namespace dxvk {
   }
 
 
-  void D3D9DeviceEx::UploadPerDrawData(
+   void D3D9DeviceEx::UploadPerDrawData(
           UINT&                   FirstVertexIndex,
           UINT                    NumVertices,
           UINT&                   FirstIndex,
@@ -5666,7 +5655,7 @@ namespace dxvk {
     bool dynamicSysmemVBOs = usedBuffersMask == m_vbSlotTracking.uploadPerDraw;
 
     D3D9CommonBuffer* ibo = GetCommonBuffer(m_state.indices);
-    bool dynamicSysmemIBO = NumIndices != 0 && ibo != nullptr && (ibo->DoPerDrawUpload() || CanOnlySWVP());
+    bool dynamicSysmemIBO = NumIndices != 0 && ibo != nullptr && ibo->DoPerDrawUpload();
 
     *pDynamicVBOs = dynamicSysmemVBOs;
 

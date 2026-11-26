@@ -113,29 +113,14 @@ namespace dxvk {
     /// Forces sample rate shading
     bool forceSampleRateShading;
 
-    /// Allow D3DLOCK_DISCARD
-    bool allowDiscard;
-
     /// Enumerate adapters by displays
     bool enumerateByDisplays;
 
     /// Report displays on the same Vulkan device as one adapter group
     bool adapterGroups;
 
-    /// Cached dynamic buffers: Maps all buffers in cached memory.
-    bool cachedWriteOnlyBuffers;
-
     /// Use device local memory for constant buffers.
     Tristate deviceLocalConstantBuffers;
-
-    /// Disable direct buffer mapping
-    bool allowDirectBufferMapping;
-
-    /// Force flushing D3DPOOL_DEFAULT buffers at draw time rather than on unlock
-    /// Used to work around game bugs in source engine games like CSGO and Insurgency.
-    /// Those games write to buffers after unlocking them. Uploading on unlock leads to black
-    /// objects because they never get their proper UVs.
-    bool forceDrawTimeBufferUpload;
 
     /// Ignore the lock range passed to Buffer::Lock for buffers in the D3DPOOL_DEFAULT and mark the whole buffer
     /// dirty instead.

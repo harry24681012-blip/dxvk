@@ -9,7 +9,7 @@ namespace dxvk {
           D3D9DeviceEx*      pDevice,
     const D3D9_BUFFER_DESC*  pDesc)
     : m_parent ( pDevice ), m_desc ( *pDesc ),
-      m_mapMode(DetermineMapMode(pDevice->GetOptions())) {
+      m_mapMode(DetermineMapMode()) {
     m_buffer = CreateBuffer();
     if (m_mapMode == D3D9_COMMON_BUFFER_MAP_MODE_BUFFER)
       m_stagingBuffer = CreateStagingBuffer();
@@ -18,8 +18,6 @@ namespace dxvk {
 
     if (m_desc.Pool != D3DPOOL_DEFAULT)
       m_dirtyRange = D3D9Range(0, m_desc.Size);
-
-    m_uploadAtDraw = m_parent->GetOptions()->forceDrawTimeBufferUpload;
   }
 
   D3D9CommonBuffer::~D3D9CommonBuffer() {
@@ -80,17 +78,17 @@ namespace dxvk {
   }
 
   
-  D3D9_COMMON_BUFFER_MAP_MODE D3D9CommonBuffer::DetermineMapMode(const D3D9Options* options) const {
-    if (m_desc.Pool != D3DPOOL_DEFAULT)
-      return D3D9_COMMON_BUFFER_MAP_MODE_BUFFER;
+  D3D9_COMMON_BUFFER_MAP_MODE D3D9CommonBuffer::DetermineMapMode() const {
+    if ((m_desc.Usage & D3DUSAGE_DYNAMIC)
+      || m_desc.Pool == D3DPOOL_SYSTEMMEM)
+      return D3D9_COMMON_BUFFER_MAP_MODE_DIRECT;
 
-    if (!(m_desc.Usage & D3DUSAGE_DYNAMIC))
-      return D3D9_COMMON_BUFFER_MAP_MODE_BUFFER;
+    if (m_desc.Pool == D3DPOOL_DEFAULT
+      && (m_parent->GetDXVKDevice()->isUnifiedMemoryArchitecture()
+      || m_parent->GetDXVKDevice()->hasResizableBar()))
+      return D3D9_COMMON_BUFFER_MAP_MODE_DIRECT;
 
-    if (!options->allowDirectBufferMapping)
-      return D3D9_COMMON_BUFFER_MAP_MODE_BUFFER;
-
-    return D3D9_COMMON_BUFFER_MAP_MODE_DIRECT;
+    return D3D9_COMMON_BUFFER_MAP_MODE_BUFFER;
   }
 
 
@@ -108,7 +106,7 @@ namespace dxvk {
       info.stages |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
       info.access |= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
 
-      if (m_parent->SupportsSWVP()) {
+      if (m_parent->SupportsProcessVertices() && isSwvpBuffer()) {
         info.usage  |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         info.stages |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
         info.access |= VK_ACCESS_SHADER_WRITE_BIT;
@@ -127,12 +125,7 @@ namespace dxvk {
       memoryFlags |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                   |  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-      if ((m_desc.Usage & D3DUSAGE_WRITEONLY) == 0
-        || DoPerDrawUpload()
-        || m_parent->CanOnlySWVP()
-        || m_parent->GetOptions()->cachedWriteOnlyBuffers) {
-        // Never use uncached memory on devices that support SWVP because we might end up reading from it.
-
+      if (!(m_desc.Usage & D3DUSAGE_WRITEONLY) || m_desc.Pool == D3DPOOL_SYSTEMMEM || !isSwvpBuffer()) {
         info.access |= VK_ACCESS_HOST_READ_BIT;
         memoryFlags |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
       } else {
@@ -162,15 +155,20 @@ namespace dxvk {
     info.access = VK_ACCESS_HOST_WRITE_BIT
                 | VK_ACCESS_TRANSFER_READ_BIT;
 
-    if (!(m_desc.Usage & D3DUSAGE_WRITEONLY))
-      info.access |= VK_ACCESS_HOST_READ_BIT;
-
     VkMemoryPropertyFlags memoryFlags = 
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-    | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-    | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+    if (!(m_desc.Usage & D3DUSAGE_WRITEONLY) || isSwvpBuffer()) {
+      info.access |= VK_ACCESS_HOST_READ_BIT;
+      memoryFlags |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    }
 
     return m_parent->GetDXVKDevice()->createBuffer(info, memoryFlags);
   }
 
+  bool D3D9CommonBuffer::isSwvpBuffer() const {
+      // D3DUSAGE_SOFTWAREPROCESSING is necessary for mixed devices and hardware processing devices don't support it at all
+      return m_parent->CanSWVP() && (m_parent->CanOnlySWVP() || (m_desc.Usage & D3DUSAGE_SOFTWAREPROCESSING));
+  }
 }

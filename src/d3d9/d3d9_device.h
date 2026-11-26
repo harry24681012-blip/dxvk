@@ -802,7 +802,7 @@ namespace dxvk {
     /**
      * \brief Returns whether the Vulkan device supports the required features for ProcessVertices
      */
-    bool SupportsSWVP();
+    bool SupportsProcessVertices();
 
     bool SupportsVCacheQuery() const;
 
@@ -913,7 +913,6 @@ namespace dxvk {
             INT&                    BaseVertexIndex,
             bool*                   pDynamicVBOs,
             bool*                   pDynamicIBO);
-
 
     void SetupFPU();
 
@@ -1124,6 +1123,8 @@ namespace dxvk {
      * \brief Removes the texture from the LRU list of mapped textures
      */
     void RemoveMappedTexture(D3D9CommonTexture* pTexture);
+
+    void RemovePointerTexture(D3D9CommonTexture* pTexture);
 
     /**
      * \brief Returns whether the device is currently recording a StateBlock
@@ -1548,8 +1549,14 @@ namespace dxvk {
 
     void InitShaderOptions();
 
+    void SyncImportedPointers();
+
     static uint32_t GetTextureStageArgMask(
             D3DTEXTUREOP          Op);
+
+    bool IsFullscreenPass(uint32_t PrimitiveCount) {
+      return PrimitiveCount <= 2;
+    }
 
     static D3D9TextureStageStateFlags GetTextureStageStateFlags(
             D3DTEXTUREOP          Op,
@@ -1676,6 +1683,8 @@ namespace dxvk {
     std::atomic<uint32_t>           m_losableResourceCounter   = { 0 };
 
     D3D9SwapChainEx*                m_mostRecentlyUsedSwapchain = nullptr;
+
+    std::vector<D3D9CommonTexture*> m_pointerImportedTextures;
 
 #ifdef DXVK_USE_UNMAPPABLE_MEMORY
     lru_list<D3D9CommonTexture*>    m_mappedTextures;
