@@ -3189,12 +3189,14 @@ namespace dxvk {
   void DxvkContext::beginRenderPassDebugRegion() {
     VkSampleCountFlagBits sampleCount = VK_SAMPLE_COUNT_1_BIT;
 
+    const auto& attachments = m_state.om.framebufferInfo.attachments();
+
     bool hasFeedbackLoop = false;
     bool hasColorAttachments = false;
-    bool hasDepthAttachment = m_state.om.renderTargets.depth.view != nullptr;
+    bool hasDepthAttachment = attachments.depth.view != nullptr;
 
     for (uint32_t i = 0; i < MaxNumRenderTargets; i++)
-      hasColorAttachments |= m_state.om.renderTargets.color[i].view != nullptr;
+      hasColorAttachments |= attachments.color[i].view != nullptr;
 
     std::stringstream label;
 
@@ -3210,29 +3212,29 @@ namespace dxvk {
     hasColorAttachments = false;
 
     for (uint32_t i = 0; i < MaxNumRenderTargets; i++) {
-      if (m_state.om.renderTargets.color[i].view) {
-        const char* imageName = m_state.om.renderTargets.color[i].view->image()->info().debugName;
+      if (attachments.color[i].view) {
+        const char* imageName = attachments.color[i].view->image()->info().debugName;
         label << (hasColorAttachments ? ", " : "") << i << ": " << (imageName ? imageName : "unknown");
 
         hasColorAttachments = true;
-        sampleCount = m_state.om.renderTargets.color[i].view->image()->info().sampleCount;
+        sampleCount = attachments.color[i].view->image()->info().sampleCount;
 
         hasFeedbackLoop = hasFeedbackLoop ||
-          (m_state.om.renderTargets.color[i].view->image()->info().usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
+          (attachments.color[i].view->image()->info().usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
       }
     }
 
-    if (m_state.om.renderTargets.depth.view) {
+    if (attachments.depth.view) {
       if (hasColorAttachments)
         label << ", ";
 
-      const char* imageName = m_state.om.renderTargets.depth.view->image()->info().debugName;
+      const char* imageName = attachments.depth.view->image()->info().debugName;
       label << "DS:" << (imageName ? imageName : "unknown");
 
-      sampleCount = m_state.om.renderTargets.depth.view->image()->info().sampleCount;
+      sampleCount = attachments.depth.view->image()->info().sampleCount;
 
       hasFeedbackLoop = hasFeedbackLoop ||
-        (m_state.om.renderTargets.depth.view->image()->info().usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
+        (attachments.depth.view->image()->info().usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
     }
 
     if (!hasColorAttachments && !hasDepthAttachment)
@@ -5358,7 +5360,8 @@ namespace dxvk {
     uint32_t counterDwordCount = layerCount * (requiresPrepass ? 2u : 1u);
 
     DxvkResourceBufferInfo counterMemory = allocateScratchMemory(
-      sizeof(uint32_t), sizeof(uint32_t) * counterDwordCount);
+      m_device->properties().core.properties.limits.minStorageBufferOffsetAlignment,
+      sizeof(uint32_t) * counterDwordCount);
 
     m_cmd->cmdFillBuffer(DxvkCmdBuffer::InitBuffer,
       counterMemory.buffer, counterMemory.offset, counterMemory.size, 0u);
@@ -6151,7 +6154,7 @@ namespace dxvk {
       // Don't discard image contents if we have
       // to spill the current render pass
       this->resetRenderPassOps(
-        m_state.om.renderTargets,
+        m_state.om.framebufferInfo.attachments(),
         m_state.om.renderPassOps);
       
       // Begin occlusion queries
@@ -6337,7 +6340,7 @@ namespace dxvk {
     // Same for MSAA. This is actually necessary for correctness as well
     // since handling render pass resolves gets all sorts of problematic,
     // and those cases are currently not handled.
-    if (m_state.gp.state.ms.sampleCount() != VK_SAMPLE_COUNT_1_BIT)
+    if (m_state.gp.state.ms.sampleCount() > VK_SAMPLE_COUNT_1_BIT)
       return false;
 
     // Otherwise, we are probably good. Post-processing and UI passes don't
@@ -6764,12 +6767,16 @@ namespace dxvk {
 
     DxvkGraphicsPipelineFlags oldFlags = m_state.gp.flags;
     DxvkGraphicsPipelineFlags newFlags = newPipeline->flags();
-    DxvkGraphicsPipelineFlags diffFlags = oldFlags ^ newFlags;
 
     m_state.gp.flags = newFlags;
 
-    if (diffFlags.test(DxvkGraphicsPipelineFlag::HasSampleMaskExport))
+    if (oldFlags.test(DxvkGraphicsPipelineFlag::HasSampleMaskExport)
+     != newFlags.test(DxvkGraphicsPipelineFlag::HasSampleMaskExport))
       m_flags.set(DxvkContextFlag::GpDirtyMultisampleState);
+
+    if (newFlags.test(DxvkGraphicsPipelineFlag::HasRasterizerDiscard)
+     != oldFlags.test(DxvkGraphicsPipelineFlag::HasRasterizerDiscard))
+      m_flags.set(DxvkContextFlag::GpDirtyRenderTargets);
 
     m_descriptorState.dirtyStages(VK_SHADER_STAGE_ALL_GRAPHICS);
 
@@ -7602,22 +7609,26 @@ namespace dxvk {
     if (m_flags.test(DxvkContextFlag::GpDirtyRenderTargets)) {
       m_flags.clr(DxvkContextFlag::GpDirtyRenderTargets);
 
+      // Do not bind any render targets if rasterizer discard is enabled. This may
+      // in some cases fix oversynchronization and reduce pipeline permutations.
+      static const DxvkRenderTargets s_noAttachments = {};
+
+      const auto& attachments = m_state.gp.flags.test(DxvkGraphicsPipelineFlag::HasRasterizerDiscard)
+        ? s_noAttachments : m_state.om.renderTargets;
+
       if (m_flags.test(DxvkContextFlag::GpRenderPassActive) && !m_flags.test(DxvkContextFlag::GpRenderPassNeedsFlush)) {
         // Only interrupt an active render pass if the render targets have actually
         // changed since the last update. There are cases where client APIs cannot
         // know in advance that consecutive draws use the same set of render targets.
-        if (m_state.om.renderTargets == m_state.om.framebufferInfo.attachments())
+        if (attachments == m_state.om.framebufferInfo.attachments())
           return;
       }
 
       // End active render pass and reset load/store ops for the new render targets.
-      DxvkFramebufferInfo fbInfo = makeFramebufferInfo(m_state.om.renderTargets);
+      DxvkFramebufferInfo fbInfo = makeFramebufferInfo(attachments);
 
       this->endCurrentPass(true);
-
-      this->resetRenderPassOps(
-        m_state.om.renderTargets,
-        m_state.om.renderPassOps);
+      this->resetRenderPassOps(attachments, m_state.om.renderPassOps);
 
       // Update relevant graphics pipeline state
       m_state.gp.state.ms.setSampleCount(fbInfo.getSampleCount());
@@ -7985,13 +7996,15 @@ namespace dxvk {
       // render most of its content with regular sample positions and only draw a small portion
       // with centered positions, so we would want the default interpretation to use default
       // sample positions anyway, e.g. for the purpose of copies or resolves.
+      const auto& depthAttachment = m_state.om.framebufferInfo.attachments().depth;
+
       auto sampleCount = m_state.gp.state.determineRasterSamples(m_device->canUseMixedSamples(m_state.gp.shaders.fs));
 
       bool center = m_state.gp.state.useSampleLocations();
       bool enable = m_device->canUseSampleLocations(sampleCount);
 
-      if (enable && m_state.om.renderTargets.depth.view) {
-        auto flags = m_state.om.renderTargets.depth.view->image()->info().flags;
+      if (enable && depthAttachment.view) {
+        auto flags = depthAttachment.view->image()->info().flags;
         enable = bool(flags & VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT);
       }
 
@@ -8258,11 +8271,13 @@ namespace dxvk {
     // If a depth-stencil image is bound used with non-default sample locations,
     // make sure that the image actually has the compat flag set.
     if (unlikely(m_state.gp.state.useSampleLocations())) {
-      if (m_state.om.renderTargets.depth.view) {
-        VkSampleCountFlagBits samples = m_state.om.renderTargets.depth.view->image()->info().sampleCount;
+      const auto& depthAttachment = m_state.om.framebufferInfo.attachments().depth;
+
+      if (depthAttachment.view) {
+        VkSampleCountFlagBits samples = depthAttachment.view->image()->info().sampleCount;
 
         if (m_device->canUseSampleLocations(samples)) {
-          auto flags = m_state.om.renderTargets.depth.view->image()->info().flags;
+          auto flags = depthAttachment.view->image()->info().flags;
 
           if (!(flags & VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT)) {
             this->endCurrentPass(true);
@@ -8270,7 +8285,7 @@ namespace dxvk {
             DxvkImageUsageInfo usage = { };
             usage.flags = VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
 
-            ensureImageCompatibility(m_state.om.renderTargets.depth.view->image(), usage);
+            ensureImageCompatibility(depthAttachment.view->image(), usage);
           }
         }
       }
@@ -9492,7 +9507,7 @@ namespace dxvk {
       return false;
 
     if (image.info().usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) {
-      const auto& view = m_state.om.renderTargets.depth.view;
+      const auto& view = m_state.om.framebufferInfo.attachments().depth.view;
 
       if (view && view->image() == &image) {
         VkImageSubresourceRange viewSubresources = view->imageSubresources();
@@ -9505,7 +9520,7 @@ namespace dxvk {
 
     if (image.info().usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) {
       for (uint32_t i = 0u; i < MaxNumRenderTargets; i++) {
-        const auto& view = m_state.om.renderTargets.color[i].view;
+        const auto& view = m_state.om.framebufferInfo.attachments().color[i].view;
 
         if (view && view->image() == &image) {
           VkImageSubresourceRange viewSubresources = view->imageSubresources();
